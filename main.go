@@ -100,7 +100,6 @@ func main() {
 }
 
 func printUsage() {
-	// (Usage message remains the same as the previous version)
 	appName := filepath.Base(os.Args[0]) // Get the name of the executable.
 	fmt.Fprintf(os.Stderr, "Usage: %s <URL_or_ID_1> [URL_or_ID_2] ...\n\n", appName)
 	fmt.Fprintf(os.Stderr, "Downloads YouTube video audio as chaptered MP3s into a folder named after the video title.\n")
@@ -113,7 +112,6 @@ func printUsage() {
 }
 
 func loadArchive(archivePath string) error {
-	// (loadArchive function remains the same)
 	archiveMutex.Lock()
 	defer archiveMutex.Unlock()
 	processedArchive = make(map[string]struct{})
@@ -139,7 +137,6 @@ func loadArchive(archivePath string) error {
 }
 
 func appendToArchive(archivePath string, identifier string) error {
-	// (appendToArchive function remains the same)
 	archiveMutex.Lock()
 	defer archiveMutex.Unlock()
 	file, err := os.OpenFile(archivePath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
@@ -248,5 +245,4 @@ func processVideo(videoIdentifier string, archivePath string, wg *sync.WaitGroup
 			processedCount.Add(1)
 		}
 	}
-	// itemsDone is incremented by the top-level defer in this function
 }
