@@ -30,6 +30,7 @@ pkg/
 *.log
 log/
 logs/
+*.txt
 
 # Fichiers système macOS
 .DS_Store
