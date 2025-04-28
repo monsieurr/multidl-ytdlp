@@ -1,0 +1,45 @@
+# Binaires Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Fichiers binaires de test
+*.test
+
+# Fichiers de couverture de code
+*.out
+
+# Dépendances
+/vendor/
+/go.sum
+
+# Fichiers générés par Go
+bin/
+pkg/
+
+# Fichiers médias
+*.mp3
+*.mp4
+*.wav
+*.avi
+*.mkv
+
+# Logs
+*.log
+log/
+logs/
+
+# Fichiers système macOS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# Fichiers IDE
+.idea/
+.vscode/
+*.swp
+*.swo

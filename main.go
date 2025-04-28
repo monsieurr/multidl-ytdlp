@@ -2,16 +2,18 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
-	"io" // Required for io.Copy
 	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time" // Required for timing
+	"syscall"
+	"time"
 )
 
 const (
@@ -19,230 +21,268 @@ const (
 	archiveFilename = "ytmp3_processed_archive.txt"
 )
 
-// --- Global State ---
-var (
-	processedCount atomic.Uint64
-	skippedCount   atomic.Uint64
-	errorCount     atomic.Uint64
-	itemsDone      atomic.Uint64 // Counter for completed items (success or error)
-)
-var archiveMutex sync.Mutex
-var processedArchive = make(map[string]struct{})
-var totalItems int      // Total items to process
-var startTime time.Time // Script start time
+type SafeSet struct {
+	sync.Mutex
+	m map[string]struct{}
+}
 
-// --- Main Execution ---
+type processingResult struct {
+	Identifier string
+	ItemNumber int
+	Error      error
+	ArchiveErr error
+	StartTime  time.Time
+	Duration   time.Duration
+}
+
+var (
+	processedCount   atomic.Uint64
+	skippedCount     atomic.Uint64
+	errorCount       atomic.Uint64
+	totalItems       int
+	startTime        time.Time
+	processedArchive SafeSet
+	pending          SafeSet
+	shutdownSignal   = make(chan os.Signal, 1)
+	outputMutex      sync.Mutex
+)
 
 func main() {
 	log.SetFlags(0)
-	startTime = time.Now() // Record start time
+	startTime = time.Now()
+
+	signal.Notify(shutdownSignal, syscall.SIGINT, syscall.SIGTERM)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	exePath, err := os.Executable()
 	if err != nil {
 		log.Fatalf("FATAL: Could not determine executable path: %v", err)
 	}
-	scriptDir := filepath.Dir(exePath)
-	archivePath := filepath.Join(scriptDir, archiveFilename)
-	log.Printf("Using archive file: %s", archivePath)
+	archivePath := filepath.Join(filepath.Dir(exePath), archiveFilename)
 
-	err = loadArchive(archivePath)
-	if err != nil {
-		log.Fatalf("FATAL: Failed to load or create archive file '%s': %v", archivePath, err)
+	if err := initArchive(archivePath); err != nil {
+		log.Fatalf("FATAL: Archive initialization failed: %v", err)
 	}
 
-	args := os.Args[1:]
-	totalItems = len(args) // Set total items count
+	args := deduplicateArgs(os.Args[1:])
+	totalItems = len(args)
 	if totalItems == 0 {
 		printUsage()
 		os.Exit(1)
 	}
 
-	log.Printf("Starting processing for %d items...", totalItems)
+	fmt.Printf("Starting processing for %d items at %s\n\n", totalItems, startTime.Format("15:04:05"))
 
 	var wg sync.WaitGroup
-	for i, videoIdentifier := range args {
-		identifier := videoIdentifier // Local copy for goroutine
-		itemNumber := i + 1           // User-friendly 1-based index
+	results := make(chan processingResult, totalItems)
 
-		archiveMutex.Lock()
-		_, exists := processedArchive[identifier]
-		archiveMutex.Unlock()
-
-		if exists {
-			log.Printf("Skipping [%d/%d]: '%s' (already in archive)", itemNumber, totalItems, identifier)
-			skippedCount.Add(1)
-			itemsDone.Add(1) // Count skipped items as "done" for progress tracking
-			continue
-		}
-
+	for i, identifier := range args {
 		wg.Add(1)
-		go processVideo(identifier, archivePath, &wg, itemNumber)
+		go processVideo(ctx, &wg, identifier, archivePath, i+1, results)
 	}
 
-	wg.Wait()
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
 
-	elapsedTime := time.Since(startTime)
-	log.Println("==================================================")
-	log.Println("Processing Summary:")
-	log.Printf("  Total Items Submitted: %d", totalItems)
-	log.Printf("  Successfully processed: %d", processedCount.Load())
-	log.Printf("  Skipped (already in archive): %d", skippedCount.Load())
-	log.Printf("  Errors: %d", errorCount.Load())
-	log.Printf("  Total items completed: %d", itemsDone.Load()) // Should match totalItems if all ran
-	log.Printf("  Archive file: %s", archivePath)
-	log.Printf("  Total processing time: %s", elapsedTime.Round(time.Second)) // Rounded duration
-	log.Println("==================================================")
+	var interrupted bool
+	defer func() { printSummary(interrupted) }()
 
-	if errorCount.Load() > 0 {
-		os.Exit(1)
+	for result := range results {
+		handleProcessingResult(result, archivePath)
 	}
-	os.Exit(0)
 }
 
-func printUsage() {
-	appName := filepath.Base(os.Args[0]) // Get the name of the executable.
-	fmt.Fprintf(os.Stderr, "Usage: %s <URL_or_ID_1> [URL_or_ID_2] ...\n\n", appName)
-	fmt.Fprintf(os.Stderr, "Downloads YouTube video audio as chaptered MP3s into a folder named after the video title.\n")
-	fmt.Fprintf(os.Stderr, "Accepts full YouTube URLs, video IDs, playlist URLs/IDs, or search terms.\n")
-	fmt.Fprintf(os.Stderr, "Uses archive file '%s' located in the same directory as the executable to avoid reprocessing videos.\n\n", archiveFilename)
-	fmt.Fprintf(os.Stderr, "Important:\n")
-	fmt.Fprintf(os.Stderr, " - Requires 'yt-dlp' to be installed and accessible in your system's PATH.\n")
-	fmt.Fprintf(os.Stderr, " - Remember to quote arguments containing special shell characters (like '&', '?', '=')\n")
-	fmt.Fprintf(os.Stderr, "   Example: %s 'https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=...' 'Some Video ID'\n", appName)
-}
+func initArchive(path string) error {
+	processedArchive = SafeSet{m: make(map[string]struct{})}
 
-func loadArchive(archivePath string) error {
-	archiveMutex.Lock()
-	defer archiveMutex.Unlock()
-	processedArchive = make(map[string]struct{})
-	file, err := os.OpenFile(archivePath, os.O_RDONLY|os.O_CREATE, 0644)
+	file, err := os.OpenFile(path, os.O_RDONLY|os.O_CREATE, 0644)
 	if err != nil {
-		return fmt.Errorf("failed to open or create archive file '%s': %w", archivePath, err)
+		return fmt.Errorf("failed to open archive: %w", err)
 	}
 	defer file.Close()
+
 	scanner := bufio.NewScanner(file)
-	count := 0
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line != "" {
-			processedArchive[line] = struct{}{}
-			count++
+			processedArchive.m[line] = struct{}{}
 		}
 	}
+
 	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("error reading archive file '%s': %w", archivePath, err)
+		return fmt.Errorf("archive read error: %w", err)
 	}
-	log.Printf("Loaded %d entries from archive.", count)
 	return nil
 }
 
-func appendToArchive(archivePath string, identifier string) error {
-	archiveMutex.Lock()
-	defer archiveMutex.Unlock()
-	file, err := os.OpenFile(archivePath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to open archive file '%s' for appending: %w", archivePath, err)
-	}
-	defer file.Close()
-	if _, err := fmt.Fprintln(file, identifier); err != nil {
-		return fmt.Errorf("failed to write identifier '%s' to archive file '%s': %w", identifier, archivePath, err)
-	}
-	processedArchive[identifier] = struct{}{}
-	return nil
-}
-
-// processVideo now includes itemNumber for progress reporting
-func processVideo(videoIdentifier string, archivePath string, wg *sync.WaitGroup, itemNumber int) {
-	// Increment itemsDone counter when this function finishes, regardless of outcome
-	defer itemsDone.Add(1)
-	// Signal WaitGroup that this goroutine is done when function exits
+func processVideo(ctx context.Context, wg *sync.WaitGroup, identifier, archivePath string, itemNumber int, results chan<- processingResult) {
 	defer wg.Done()
 
-	// --- Print Start Message with Progress ---
-	// Use Load to safely read atomic counters
-	currentItemNum := itemsDone.Load() + 1 // +1 because this one hasn't finished yet
-	log.Printf("--- Processing [%d/%d]: %s ---", currentItemNum, totalItems, videoIdentifier)
+	result := processingResult{
+		Identifier: identifier,
+		ItemNumber: itemNumber,
+		StartTime:  time.Now(),
+	}
 
-	outputTemplateChapter := fmt.Sprintf("chapter:%s/%%(title)s/%%(section_title)s - %%(title)s.%%(ext)s", outputBaseDir)
+	defer func() {
+		result.Duration = time.Since(result.StartTime)
+		results <- result
+	}()
 
-	cmd := exec.Command("yt-dlp",
-		"--color", "always", // Attempt to force color output
-		// "--no-progress",   // Alternative: uncomment if progress bars are too messy
-		"--default-search", "ytsearch",
-		"-i",
-		"-f", "bestvideo*+bestaudio/best",
+	outputMutex.Lock()
+	fmt.Printf("\n╔════ ITEM %d/%d ════════════════════════════════\n", itemNumber, totalItems)
+	fmt.Printf("║ URL: %s\n", identifier)
+	fmt.Printf("║ Start: %s\n", result.StartTime.Format("15:04:05"))
+	fmt.Println("╚═══════════════════════════════════════════════")
+	outputMutex.Unlock()
+
+	if !markPending(identifier) {
+		result.Error = fmt.Errorf("duplicate in progress")
+		return
+	}
+	defer unmarkPending(identifier)
+
+	processedArchive.Lock()
+	_, exists := processedArchive.m[identifier]
+	processedArchive.Unlock()
+
+	if exists {
+		result.Error = fmt.Errorf("skipped (archived)")
+		return
+	}
+
+	cmd := exec.CommandContext(ctx, "yt-dlp",
+		"--color", "always",
+		"--progress",
+		"--newline",
+		"--progress-template", "[download] %(progress._percent_str)s of %(progress._total_bytes_str)s at %(progress._speed_str)s ETA %(progress._eta_str)s",
+		"--console-title",
 		"--extract-audio",
 		"--audio-format", "mp3",
 		"--audio-quality", "0",
 		"--split-chapters",
 		"--embed-thumbnail",
-		"-o", outputTemplateChapter,
-		videoIdentifier,
+		"-o", fmt.Sprintf("chapter:%s/%%(title)s/%%(section_title)s - %%(title)s.%%(ext)s", outputBaseDir),
+		identifier,
 	)
 
-	// --- Setup Live Output Streaming (Directly to os.Stdout/os.Stderr) ---
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		log.Printf("ERROR [%d/%d] %s: Failed to get stdout pipe: %v", itemNumber, totalItems, videoIdentifier, err)
-		errorCount.Add(1)
-		return
-	}
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		log.Printf("ERROR [%d/%d] %s: Failed to get stderr pipe: %v", itemNumber, totalItems, videoIdentifier, err)
-		errorCount.Add(1)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		result.Error = fmt.Errorf("yt-dlp error: %w", err)
 		return
 	}
 
-	if err := cmd.Start(); err != nil {
-		log.Printf("ERROR [%d/%d] %s: Failed to start yt-dlp command: %v", itemNumber, totalItems, videoIdentifier, err)
-		errorCount.Add(1)
-		return
+	if err := appendToArchive(archivePath, identifier); err != nil {
+		result.ArchiveErr = err
 	}
-	// We won't log PID here to keep output cleaner, focusing on yt-dlp's output
+}
 
-	// Use io.Copy for potentially more efficient streaming directly to outputs
-	var streamWg sync.WaitGroup
-	streamWg.Add(2)
+func markPending(identifier string) bool {
+	pending.Lock()
+	defer pending.Unlock()
 
-	go func() {
-		defer streamWg.Done()
-		// Copy yt-dlp's stdout directly to our program's stdout
-		_, copyErr := io.Copy(os.Stdout, stdoutPipe)
-		if copyErr != nil && copyErr != io.EOF {
-			// Log errors copying the stream, but might be expected on close
-			// log.Printf("WARN [%d/%d] %s: Error copying yt-dlp stdout: %v", itemNumber, totalItems, videoIdentifier, copyErr)
-		}
-	}()
+	if pending.m == nil {
+		pending.m = make(map[string]struct{})
+	}
 
-	go func() {
-		defer streamWg.Done()
-		// Copy yt-dlp's stderr directly to our program's stderr
-		_, copyErr := io.Copy(os.Stderr, stderrPipe)
-		if copyErr != nil && copyErr != io.EOF {
-			// log.Printf("WARN [%d/%d] %s: Error copying yt-dlp stderr: %v", itemNumber, totalItems, videoIdentifier, copyErr)
-		}
-	}()
+	if _, exists := pending.m[identifier]; exists {
+		return false
+	}
 
-	streamWg.Wait() // Wait for both streams to finish copying
+	pending.m[identifier] = struct{}{}
+	return true
+}
 
-	err = cmd.Wait()
+func unmarkPending(identifier string) {
+	pending.Lock()
+	defer pending.Unlock()
+	delete(pending.m, identifier)
+}
 
-	// --- Handle Command Result & Print End Message ---
-	doneCount := itemsDone.Load() + 1 // Get the count *after* this item is logically done
+func appendToArchive(path string, identifier string) error {
+	processedArchive.Lock()
+	defer processedArchive.Unlock()
+
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
 	if err != nil {
-		log.Printf("--- ERROR Finished [%d/%d]: %s (yt-dlp error: %v) ---", doneCount, totalItems, videoIdentifier, err)
+		return fmt.Errorf("archive open failed: %w", err)
+	}
+	defer file.Close()
+
+	if _, err := fmt.Fprintln(file, identifier); err != nil {
+		return fmt.Errorf("archive write failed: %w", err)
+	}
+
+	processedArchive.m[identifier] = struct{}{}
+	return nil
+}
+
+func handleProcessingResult(result processingResult, archivePath string) {
+	baseMsg := fmt.Sprintf("[%d] %s (%s)",
+		result.ItemNumber, result.Identifier, result.Duration.Round(time.Second))
+
+	switch {
+	case result.ArchiveErr != nil:
+		log.Printf("%s - Archive Error: %v", baseMsg, result.ArchiveErr)
 		errorCount.Add(1)
-		// Don't return here, let itemsDone be incremented by the defer
-	} else {
-		// Attempt to archive only on success
-		archiveErr := appendToArchive(archivePath, videoIdentifier)
-		if archiveErr != nil {
-			log.Printf("--- ERROR Finished [%d/%d]: %s (Failed to update archive: %v) ---", doneCount, totalItems, videoIdentifier, archiveErr)
-			errorCount.Add(1) // Count archive failure as an error
+	case result.Error != nil:
+		if strings.Contains(result.Error.Error(), "skipped") {
+			log.Printf("%s - Skipped", baseMsg)
+			skippedCount.Add(1)
 		} else {
-			log.Printf("--- Success Finished [%d/%d]: %s (Archived) ---", doneCount, totalItems, videoIdentifier)
-			processedCount.Add(1)
+			log.Printf("%s - Failed: %v", baseMsg, result.Error)
+			errorCount.Add(1)
+		}
+	default:
+		log.Printf("%s - Success", baseMsg)
+		processedCount.Add(1)
+	}
+}
+
+func deduplicateArgs(args []string) []string {
+	seen := make(map[string]struct{})
+	unique := make([]string, 0, len(args))
+	for _, arg := range args {
+		if _, exists := seen[arg]; !exists {
+			seen[arg] = struct{}{}
+			unique = append(unique, arg)
 		}
 	}
+	return unique
+}
+
+func printSummary(interrupted bool) {
+	elapsed := time.Since(startTime)
+
+	fmt.Println("\n═══════════════════════════════════════════════")
+	if interrupted {
+		fmt.Println(" PROCESSING INTERRUPTED")
+	} else {
+		fmt.Println(" PROCESSING COMPLETE")
+	}
+
+	fmt.Println("═══════════════════════════════════════════════")
+	fmt.Printf("  Total items submitted:   %d\n", totalItems)
+	fmt.Printf("  Successfully processed:  %d\n", processedCount.Load())
+	fmt.Printf("  Skipped (archived):      %d\n", skippedCount.Load())
+	fmt.Printf("  Errors:                  %d\n", errorCount.Load())
+	fmt.Printf("  Total duration:          %s\n", elapsed.Round(time.Second))
+	fmt.Println("═══════════════════════════════════════════════")
+}
+
+func printUsage() {
+	fmt.Printf(`
+Usage: %s [URL/ID...]
+
+Process YouTube videos/playlists and save as chaptered MP3s
+Uses archive file: %s
+
+Arguments:
+  Accepts multiple YouTube URLs/IDs, playlist links, or search terms
+`, filepath.Base(os.Args[0]), archiveFilename)
 }
